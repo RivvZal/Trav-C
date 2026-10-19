@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+*.exe
+t
+data.json*
+*.tmp
+.gocache
+.gomodcache
+.tmp-go-cache
+.vercel
+.git

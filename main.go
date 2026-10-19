@@ -5,24 +5,28 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
+	"embed"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"math/big"
+	"net"
 	"net/http"
 	"net/mail"
 	"net/smtp"
 	"os"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 )
 
 type User struct {
@@ -45,14 +49,26 @@ type publicUser struct {
 	Avatar   string `json:"avatar,omitempty"`
 }
 type postView struct {
-	ID         string     `json:"id"`
-	Caption    string     `json:"caption"`
-	Image      string     `json:"image,omitempty"`
-	CreatedAt  time.Time  `json:"createdAt"`
-	Author     publicUser `json:"author"`
-	LikeCount  int        `json:"likeCount"`
-	LikedByMe  bool       `json:"likedByMe"`
-	ReplyCount int        `json:"replyCount"`
+	ID         string         `json:"id"`
+	Caption    string         `json:"caption"`
+	Image      string         `json:"image,omitempty"`
+	CreatedAt  time.Time      `json:"createdAt"`
+	Author     publicUser     `json:"author"`
+	LikeCount  int            `json:"likeCount"`
+	LikedByMe  bool           `json:"likedByMe"`
+	ReplyCount int            `json:"replyCount"`
+	SavedByMe  bool           `json:"savedByMe"`
+	MyReaction string         `json:"myReaction"`
+	Reactions  map[string]int `json:"reactions"`
+}
+type storyView struct {
+	ID        string     `json:"id"`
+	Caption   string     `json:"caption"`
+	Image     string     `json:"image,omitempty"`
+	CreatedAt time.Time  `json:"createdAt"`
+	ExpiresAt time.Time  `json:"expiresAt"`
+	Viewed    bool       `json:"viewed"`
+	Author    publicUser `json:"author"`
 }
 type postReplyView struct {
 	ID        string     `json:"id"`
@@ -60,29 +76,72 @@ type postReplyView struct {
 	CreatedAt time.Time  `json:"createdAt"`
 	Author    publicUser `json:"author"`
 }
-type server struct {
-	db       *sql.DB
-	mu       sync.Mutex
-	sessions map[string]string
+type notificationView struct {
+	ID        string     `json:"id"`
+	Kind      string     `json:"kind"`
+	EntityID  string     `json:"entityId"`
+	CreatedAt time.Time  `json:"createdAt"`
+	ReadAt    *time.Time `json:"readAt"`
+	Actor     publicUser `json:"actor"`
 }
+type server struct {
+	db *sql.DB
+}
+
+//go:embed web
+var embeddedWeb embed.FS
 
 func main() {
 	loadDotEnv()
-	dsn := env("MYSQL_DSN", "root:@tcp(127.0.0.1:3306)/temanaja?parseTime=true&charset=utf8mb4&collation=utf8mb4_unicode_ci")
-	db, err := sql.Open("mysql", dsn)
+	dsn := os.Getenv("MYSQL_DSN")
+	if dsn == "" {
+		if os.Getenv("VERCEL") == "1" {
+			log.Fatal("MYSQL_DSN wajib diisi pada Vercel dan harus menunjuk ke MySQL yang dapat diakses dari internet.")
+		}
+		dsn = "root:@tcp(127.0.0.1:3306)/temanaja?parseTime=true&charset=utf8mb4&collation=utf8mb4_unicode_ci"
+	}
+	var db *sql.DB
+	var err error
+	if caPEM := os.Getenv("MYSQL_CA_CERT"); caPEM != "" {
+		cfg, parseErr := mysql.ParseDSN(dsn)
+		if parseErr != nil {
+			log.Fatalf("MYSQL_DSN tidak valid: %v", parseErr)
+		}
+		host, _, splitErr := net.SplitHostPort(cfg.Addr)
+		if splitErr != nil {
+			log.Fatalf("Alamat host MYSQL_DSN tidak valid: %v", splitErr)
+		}
+		roots := x509.NewCertPool()
+		if !roots.AppendCertsFromPEM([]byte(caPEM)) {
+			log.Fatal("MYSQL_CA_CERT bukan sertifikat PEM yang valid.")
+		}
+		cfg.TLS = &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots, ServerName: host}
+		connector, connectorErr := mysql.NewConnector(cfg)
+		if connectorErr != nil {
+			log.Fatalf("Konfigurasi koneksi MySQL gagal: %v", connectorErr)
+		}
+		db = sql.OpenDB(connector)
+	} else {
+		db, err = sql.Open("mysql", dsn)
+	}
 	if err != nil {
 		log.Fatal(err)
 	}
 	db.SetConnMaxLifetime(3 * time.Minute)
-	db.SetMaxOpenConns(12)
-	db.SetMaxIdleConns(6)
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(2)
 	if err = db.Ping(); err != nil {
 		log.Fatalf("Tidak dapat terhubung ke MySQL: %v. Pastikan database temanaja sudah dibuat dan MYSQL_DSN benar.", err)
 	}
 	if err = initSchema(db); err != nil {
 		log.Fatalf("Gagal menyiapkan tabel MySQL: %v", err)
 	}
-	s := &server{db: db, sessions: map[string]string{}}
+	s := &server{db: db}
+	webFiles, err := fs.Sub(embeddedWeb, "web")
+	if err != nil {
+		log.Fatal(err)
+	}
+	webHandler := http.FileServer(http.FS(webFiles))
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/me", s.me)
 	mux.HandleFunc("POST /api/register", s.register)
@@ -96,7 +155,7 @@ func main() {
 	mux.HandleFunc("GET /reset-password", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Referrer-Policy", "no-referrer")
-		http.ServeFile(w, r, "web/reset-password.html")
+		serveEmbeddedPage(w, r, webFiles, "reset-password.html")
 	})
 	mux.HandleFunc("PUT /api/profile", s.updateProfile)
 	mux.HandleFunc("POST /api/onboarding/complete", s.completeOnboarding)
@@ -109,26 +168,38 @@ func main() {
 	mux.HandleFunc("POST /api/blocks/{id}", s.blockUser)
 	mux.HandleFunc("DELETE /api/blocks/{id}", s.unblockUser)
 	mux.HandleFunc("GET /api/requests", s.requests)
+	mux.HandleFunc("GET /api/notifications", s.notifications)
+	mux.HandleFunc("POST /api/notifications/read-all", s.readAllNotifications)
+	mux.HandleFunc("POST /api/notifications/{id}/read", s.readNotification)
 	mux.HandleFunc("POST /api/requests", s.createRequest)
 	mux.HandleFunc("POST /api/requests/{id}/accept", s.acceptRequest)
 	mux.HandleFunc("POST /api/requests/{id}/decline", s.declineRequest)
 	mux.HandleFunc("GET /api/posts", s.posts)
+	mux.HandleFunc("GET /api/saved-posts", s.savedPosts)
 	mux.HandleFunc("POST /api/posts", s.createPost)
 	mux.HandleFunc("DELETE /api/posts/{id}", s.deletePost)
 	mux.HandleFunc("PUT /api/posts/{id}", s.updatePost)
 	mux.HandleFunc("PUT /api/posts/{id}/like", s.likePost)
 	mux.HandleFunc("DELETE /api/posts/{id}/like", s.likePost)
+	mux.HandleFunc("PUT /api/posts/{id}/reaction", s.reactPost)
+	mux.HandleFunc("DELETE /api/posts/{id}/reaction", s.reactPost)
 	mux.HandleFunc("GET /api/posts/{id}/replies", s.postReplies)
 	mux.HandleFunc("POST /api/posts/{id}/replies", s.createPostReply)
+	mux.HandleFunc("PUT /api/posts/{id}/save", s.savePost)
+	mux.HandleFunc("DELETE /api/posts/{id}/save", s.savePost)
+	mux.HandleFunc("GET /api/stories", s.stories)
+	mux.HandleFunc("POST /api/stories", s.createStory)
+	mux.HandleFunc("POST /api/stories/{id}/view", s.viewStory)
+	mux.HandleFunc("DELETE /api/stories/{id}", s.deleteStory)
 	mux.HandleFunc("GET /api/conversations", s.conversations)
 	mux.HandleFunc("GET /api/messages", s.messages)
 	mux.HandleFunc("POST /api/messages", s.sendMessage)
 	mux.HandleFunc("GET /manifest.webmanifest", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/manifest+json; charset=utf-8")
-		http.ServeFile(w, r, "web/manifest.webmanifest")
+		webHandler.ServeHTTP(w, r)
 	})
-	mux.Handle("/", http.FileServer(http.Dir("web")))
-	addr := env("ADDR", ":8080")
+	mux.Handle("/", webHandler)
+	addr := env("ADDR", ":"+env("PORT", "8080"))
 	log.Printf("gibahin.id berjalan di http://localhost%s", addr)
 	log.Fatal(http.ListenAndServe(addr, securityHeaders(mux)))
 }
@@ -167,14 +238,31 @@ func env(key, fallback string) string {
 	}
 	return fallback
 }
+
+func serveEmbeddedPage(w http.ResponseWriter, r *http.Request, webFiles fs.FS, name string) {
+	data, err := fs.ReadFile(webFiles, name)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(data)
+}
+
 func initSchema(db *sql.DB) error {
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS users (id CHAR(32) PRIMARY KEY, name VARCHAR(100) NOT NULL, email VARCHAR(254) NOT NULL UNIQUE, username VARCHAR(24) NULL UNIQUE, bio VARCHAR(280) NOT NULL DEFAULT '', avatar MEDIUMTEXT NULL, password_hash VARCHAR(160) NOT NULL, email_verified BOOLEAN NOT NULL DEFAULT FALSE, onboarding_complete BOOLEAN NOT NULL DEFAULT FALSE, created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), INDEX idx_users_name(name)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+		`CREATE TABLE IF NOT EXISTS sessions (id CHAR(64) PRIMARY KEY, user_id CHAR(32) NOT NULL, created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), expires_at DATETIME(6) NOT NULL, INDEX idx_sessions_user(user_id), INDEX idx_sessions_expiry(expires_at), CONSTRAINT fk_session_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 		`CREATE TABLE IF NOT EXISTS email_verifications (user_id CHAR(32) PRIMARY KEY, token_hash CHAR(64) NOT NULL UNIQUE, expires_at DATETIME(6) NOT NULL, CONSTRAINT fk_verify_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 		`CREATE TABLE IF NOT EXISTS email_verification_meta (user_id CHAR(32) PRIMARY KEY, attempts TINYINT UNSIGNED NOT NULL DEFAULT 0, last_sent_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), CONSTRAINT fk_verify_meta_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 		`CREATE TABLE IF NOT EXISTS password_reset_tokens (user_id CHAR(32) PRIMARY KEY, token_hash CHAR(64) NOT NULL UNIQUE, expires_at DATETIME(6) NOT NULL, created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), CONSTRAINT fk_password_reset_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 		`CREATE TABLE IF NOT EXISTS friendships (id CHAR(32) PRIMARY KEY, requester_id CHAR(32) NOT NULL, recipient_id CHAR(32) NOT NULL, state ENUM('pending','friends') NOT NULL DEFAULT 'pending', created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), UNIQUE KEY uq_friend_direction(requester_id,recipient_id), INDEX idx_friend_recipient(recipient_id,state), CONSTRAINT fk_friend_requester FOREIGN KEY(requester_id) REFERENCES users(id) ON DELETE CASCADE, CONSTRAINT fk_friend_recipient FOREIGN KEY(recipient_id) REFERENCES users(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+		`CREATE TABLE IF NOT EXISTS notifications (id CHAR(32) PRIMARY KEY, user_id CHAR(32) NOT NULL, actor_id CHAR(32) NOT NULL, kind ENUM('friend_request','friend_accepted','message','post','like','reply') NOT NULL, entity_id CHAR(32) NOT NULL DEFAULT '', created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), read_at DATETIME(6) NULL, INDEX idx_notifications_user_date(user_id,created_at), INDEX idx_notifications_user_unread(user_id,read_at,created_at), CONSTRAINT fk_notification_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE, CONSTRAINT fk_notification_actor FOREIGN KEY(actor_id) REFERENCES users(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 		`CREATE TABLE IF NOT EXISTS posts (id CHAR(32) PRIMARY KEY, user_id CHAR(32) NOT NULL, caption VARCHAR(1000) NOT NULL DEFAULT '', image MEDIUMTEXT NULL, created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), INDEX idx_posts_user_date(user_id,created_at), CONSTRAINT fk_post_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+		`CREATE TABLE IF NOT EXISTS saved_posts (user_id CHAR(32) NOT NULL, post_id CHAR(32) NOT NULL, created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), PRIMARY KEY(user_id,post_id), INDEX idx_saved_post(post_id), CONSTRAINT fk_saved_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE, CONSTRAINT fk_saved_post FOREIGN KEY(post_id) REFERENCES posts(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+		`CREATE TABLE IF NOT EXISTS post_reactions (post_id CHAR(32) NOT NULL, user_id CHAR(32) NOT NULL, reaction VARCHAR(16) NOT NULL, created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), PRIMARY KEY(post_id,user_id), INDEX idx_reaction_post(post_id,reaction), CONSTRAINT fk_reaction_post FOREIGN KEY(post_id) REFERENCES posts(id) ON DELETE CASCADE, CONSTRAINT fk_reaction_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+		`CREATE TABLE IF NOT EXISTS stories (id CHAR(32) PRIMARY KEY, user_id CHAR(32) NOT NULL, caption VARCHAR(280) NOT NULL DEFAULT '', image MEDIUMTEXT NULL, created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), expires_at DATETIME(6) NOT NULL, INDEX idx_story_user_expiry(user_id,expires_at), CONSTRAINT fk_story_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+		`CREATE TABLE IF NOT EXISTS story_views (story_id CHAR(32) NOT NULL, user_id CHAR(32) NOT NULL, viewed_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), PRIMARY KEY(story_id,user_id), INDEX idx_story_viewer(user_id), CONSTRAINT fk_story_view_story FOREIGN KEY(story_id) REFERENCES stories(id) ON DELETE CASCADE, CONSTRAINT fk_story_view_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 		`CREATE TABLE IF NOT EXISTS post_likes (post_id CHAR(32) NOT NULL, user_id CHAR(32) NOT NULL, created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), PRIMARY KEY(post_id,user_id), INDEX idx_post_likes_user(user_id), CONSTRAINT fk_post_like_post FOREIGN KEY(post_id) REFERENCES posts(id) ON DELETE CASCADE, CONSTRAINT fk_post_like_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 		`CREATE TABLE IF NOT EXISTS post_replies (id CHAR(32) PRIMARY KEY, post_id CHAR(32) NOT NULL, user_id CHAR(32) NOT NULL, body VARCHAR(1000) NOT NULL, created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), INDEX idx_post_replies_date(post_id,created_at), CONSTRAINT fk_post_reply_post FOREIGN KEY(post_id) REFERENCES posts(id) ON DELETE CASCADE, CONSTRAINT fk_post_reply_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 		`CREATE TABLE IF NOT EXISTS messages (id CHAR(32) PRIMARY KEY, sender_id CHAR(32) NOT NULL, recipient_id CHAR(32) NOT NULL, body VARCHAR(4000) NOT NULL, created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), INDEX idx_messages_pair_date(sender_id,recipient_id,created_at), INDEX idx_messages_reverse_date(recipient_id,sender_id,created_at), CONSTRAINT fk_message_sender FOREIGN KEY(sender_id) REFERENCES users(id) ON DELETE CASCADE, CONSTRAINT fk_message_recipient FOREIGN KEY(recipient_id) REFERENCES users(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
@@ -187,8 +275,39 @@ func initSchema(db *sql.DB) error {
 			return err
 		}
 	}
+	_, err := db.Exec(`INSERT INTO notifications(id,user_id,actor_id,kind,entity_id,created_at) SELECT REPLACE(UUID(),'-',''),f.recipient_id,f.requester_id,'friend_request',f.id,f.created_at FROM friendships f WHERE f.state='pending' AND NOT EXISTS(SELECT 1 FROM notifications n WHERE n.user_id=f.recipient_id AND n.kind='friend_request' AND n.entity_id=f.id)`)
+	if err != nil {
+		return err
+	}
 	return nil
 }
+func (s *server) addNotification(userID, actorID, kind, entityID string) {
+	if userID == "" || actorID == "" || userID == actorID {
+		return
+	}
+	_, _ = s.db.Exec(`INSERT INTO notifications(id,user_id,actor_id,kind,entity_id) VALUES(?,?,?,?,?)`, randomID(), userID, actorID, kind, entityID)
+}
+
+func (s *server) notifyPostFriends(ownerID, postID string) {
+	rows, err := s.db.Query(`SELECT requester_id FROM friendships WHERE state='friends' AND recipient_id=? UNION SELECT recipient_id FROM friendships WHERE state='friends' AND requester_id=?`, ownerID, ownerID)
+	if err != nil {
+		return
+	}
+	friendIDs := []string{}
+	for rows.Next() {
+		var friendID string
+		if rows.Scan(&friendID) == nil {
+			friendIDs = append(friendIDs, friendID)
+		}
+	}
+	_ = rows.Close()
+	for _, friendID := range friendIDs {
+		if !s.isBlocked(ownerID, friendID) {
+			s.addNotification(friendID, ownerID, "post", postID)
+		}
+	}
+}
+
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -315,21 +434,22 @@ func (s *server) current(r *http.Request) (User, bool) {
 	if err != nil {
 		return User{}, false
 	}
-	s.mu.Lock()
-	id, ok := s.sessions[c.Value]
-	s.mu.Unlock()
-	if !ok {
+	var id string
+	err = s.db.QueryRow(`SELECT user_id FROM sessions WHERE id=? AND expires_at>CURRENT_TIMESTAMP(6)`, tokenHash(c.Value)).Scan(&id)
+	if err != nil {
 		return User{}, false
 	}
 	u, err := s.getUser(id)
 	return u, err == nil
 }
-func (s *server) setSession(w http.ResponseWriter, u User) {
+func (s *server) setSession(w http.ResponseWriter, r *http.Request, u User) error {
 	token := randomID() + randomID()
-	s.mu.Lock()
-	s.sessions[token] = u.ID
-	s.mu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: "temanaja_session", Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: 60 * 60 * 24 * 30})
+	if _, err := s.db.Exec(`INSERT INTO sessions(id,user_id,expires_at) VALUES(?,?,DATE_ADD(CURRENT_TIMESTAMP(6),INTERVAL 30 DAY))`, tokenHash(token), u.ID); err != nil {
+		return err
+	}
+	secure := r.TLS != nil || strings.EqualFold(strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]), "https") || os.Getenv("VERCEL") == "1"
+	http.SetCookie(w, &http.Cookie{Name: "temanaja_session", Value: token, Path: "/", HttpOnly: true, Secure: secure, SameSite: http.SameSiteLaxMode, MaxAge: 60 * 60 * 24 * 30})
+	return nil
 }
 func (s *server) me(w http.ResponseWriter, r *http.Request) {
 	u, ok := s.current(r)
@@ -519,7 +639,10 @@ func (s *server) verifyEmailCode(w http.ResponseWriter, r *http.Request) {
 		fail(w, 500, "Akun belum dapat dimuat.")
 		return
 	}
-	s.setSession(w, u)
+	if err := s.setSession(w, r, u); err != nil {
+		fail(w, 500, "Sesi masuk belum dapat dibuat.")
+		return
+	}
 	writeJSON(w, 200, u)
 }
 
@@ -625,7 +748,10 @@ func (s *server) verifyEmail(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Akun belum dapat dimuat.", 500)
 		return
 	}
-	s.setSession(w, u)
+	if err := s.setSession(w, r, u); err != nil {
+		http.Error(w, "Sesi masuk belum dapat dibuat.", 500)
+		return
+	}
 	http.Redirect(w, r, "/?verified=success", http.StatusSeeOther)
 }
 func (s *server) login(w http.ResponseWriter, r *http.Request) {
@@ -653,7 +779,10 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 	u.Avatar = avatar.String
 	u.Verified = verified
 	u.Onboarding = onboard
-	s.setSession(w, u)
+	if err := s.setSession(w, r, u); err != nil {
+		fail(w, 500, "Sesi masuk belum dapat dibuat.")
+		return
+	}
 	writeJSON(w, 200, u)
 }
 
@@ -761,6 +890,9 @@ func (s *server) confirmPasswordReset(w http.ResponseWriter, r *http.Request) {
 	if _, err = tx.ExecContext(r.Context(), `UPDATE users SET password_hash=? WHERE id=?`, passwordHash(in.Password), userID); err == nil {
 		_, err = tx.ExecContext(r.Context(), `DELETE FROM password_reset_tokens WHERE user_id=?`, userID)
 	}
+	if err == nil {
+		_, err = tx.ExecContext(r.Context(), `DELETE FROM sessions WHERE user_id=?`, userID)
+	}
 	if err != nil {
 		fail(w, 500, "Kata sandi belum dapat diperbarui.")
 		return
@@ -769,21 +901,12 @@ func (s *server) confirmPasswordReset(w http.ResponseWriter, r *http.Request) {
 		fail(w, 500, "Kata sandi belum dapat diperbarui.")
 		return
 	}
-	s.mu.Lock()
-	for session, id := range s.sessions {
-		if id == userID {
-			delete(s.sessions, session)
-		}
-	}
-	s.mu.Unlock()
 	writeJSON(w, 200, map[string]string{"message": "Kata sandi berhasil diatur ulang. Silakan masuk dengan kata sandi baru."})
 }
 
 func (s *server) logout(w http.ResponseWriter, r *http.Request) {
 	if c, e := r.Cookie("temanaja_session"); e == nil {
-		s.mu.Lock()
-		delete(s.sessions, c.Value)
-		s.mu.Unlock()
+		_, _ = s.db.Exec(`DELETE FROM sessions WHERE id=?`, tokenHash(c.Value))
 	}
 	http.SetCookie(w, &http.Cookie{Name: "temanaja_session", Value: "", Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: -1})
 	writeJSON(w, 200, map[string]bool{"ok": true})
@@ -963,7 +1086,7 @@ func (s *server) userPosts(w http.ResponseWriter, r *http.Request) {
 		fail(w, 404, "Postingan teman tidak ditemukan.")
 		return
 	}
-	rows, err := s.db.Query(`SELECT p.id,p.caption,p.image,p.created_at,u.id,u.name,u.username,u.bio,u.avatar,(SELECT COUNT(*) FROM post_likes pl WHERE pl.post_id=p.id),EXISTS(SELECT 1 FROM post_likes mine WHERE mine.post_id=p.id AND mine.user_id=?),(SELECT COUNT(*) FROM post_replies pr WHERE pr.post_id=p.id) FROM posts p JOIN users u ON u.id=p.user_id WHERE p.user_id=? ORDER BY p.created_at DESC LIMIT 100`, me.ID, id)
+	rows, err := s.db.Query(postSelect+` WHERE p.user_id=? ORDER BY p.created_at DESC LIMIT 100`, me.ID, me.ID, me.ID, id)
 	if err != nil {
 		fail(w, 500, "Profil teman belum dapat dimuat.")
 		return
@@ -974,10 +1097,12 @@ func (s *server) userPosts(w http.ResponseWriter, r *http.Request) {
 		var p postView
 		var image, avatar sql.NullString
 		var u publicUser
-		if rows.Scan(&p.ID, &p.Caption, &image, &p.CreatedAt, &u.ID, &u.Name, &u.Username, &u.Bio, &avatar, &p.LikeCount, &p.LikedByMe, &p.ReplyCount) == nil {
+		var heart, laugh, care, wow, sad int
+		if rows.Scan(&p.ID, &p.Caption, &image, &p.CreatedAt, &u.ID, &u.Name, &u.Username, &u.Bio, &avatar, &p.LikeCount, &p.LikedByMe, &p.ReplyCount, &p.SavedByMe, &p.MyReaction, &heart, &laugh, &care, &wow, &sad) == nil {
 			p.Image = image.String
 			u.Avatar = avatar.String
 			p.Author = u
+			p.Reactions = map[string]int{"heart": heart, "laugh": laugh, "care": care, "wow": wow, "sad": sad}
 			out = append(out, p)
 		}
 	}
@@ -1134,6 +1259,66 @@ func (s *server) requests(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, out)
 }
+func (s *server) notifications(w http.ResponseWriter, r *http.Request) {
+	me, ok := s.current(r)
+	if !ok {
+		fail(w, 401, "Silakan masuk terlebih dahulu.")
+		return
+	}
+	rows, err := s.db.Query(`SELECT n.id,n.kind,n.entity_id,n.created_at,n.read_at,u.id,u.name,u.username,u.bio,u.avatar FROM notifications n JOIN users u ON u.id=n.actor_id WHERE n.user_id=? AND NOT EXISTS(SELECT 1 FROM blocked_users b WHERE (b.blocker_id=n.user_id AND b.blocked_id=n.actor_id) OR (b.blocker_id=n.actor_id AND b.blocked_id=n.user_id)) ORDER BY n.created_at DESC LIMIT 50`, me.ID)
+	if err != nil {
+		fail(w, 500, "Notifikasi gagal dimuat.")
+		return
+	}
+	defer rows.Close()
+	out := []notificationView{}
+	for rows.Next() {
+		var item notificationView
+		var readAt sql.NullTime
+		var avatar sql.NullString
+		if err := rows.Scan(&item.ID, &item.Kind, &item.EntityID, &item.CreatedAt, &readAt, &item.Actor.ID, &item.Actor.Name, &item.Actor.Username, &item.Actor.Bio, &avatar); err != nil {
+			fail(w, 500, "Notifikasi gagal dimuat.")
+			return
+		}
+		item.Actor.Avatar = avatar.String
+		if readAt.Valid {
+			item.ReadAt = &readAt.Time
+		}
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		fail(w, 500, "Notifikasi gagal dimuat.")
+		return
+	}
+	writeJSON(w, 200, out)
+}
+
+func (s *server) readNotification(w http.ResponseWriter, r *http.Request) {
+	me, ok := s.current(r)
+	if !ok {
+		fail(w, 401, "Silakan masuk terlebih dahulu.")
+		return
+	}
+	if _, err := s.db.Exec(`UPDATE notifications SET read_at=COALESCE(read_at,CURRENT_TIMESTAMP(6)) WHERE id=? AND user_id=?`, r.PathValue("id"), me.ID); err != nil {
+		fail(w, 500, "Status notifikasi gagal diperbarui.")
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+func (s *server) readAllNotifications(w http.ResponseWriter, r *http.Request) {
+	me, ok := s.current(r)
+	if !ok {
+		fail(w, 401, "Silakan masuk terlebih dahulu.")
+		return
+	}
+	if _, err := s.db.Exec(`UPDATE notifications SET read_at=CURRENT_TIMESTAMP(6) WHERE user_id=? AND read_at IS NULL`, me.ID); err != nil {
+		fail(w, 500, "Status notifikasi gagal diperbarui.")
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
 func (s *server) createRequest(w http.ResponseWriter, r *http.Request) {
 	me, ok := s.current(r)
 	if !ok {
@@ -1165,17 +1350,22 @@ func (s *server) createRequest(w http.ResponseWriter, r *http.Request) {
 	err := s.db.QueryRow(`SELECT state,requester_id FROM friendships WHERE (requester_id=? AND recipient_id=?) OR (requester_id=? AND recipient_id=?) LIMIT 1`, me.ID, in.UserID, in.UserID, me.ID).Scan(&state, &requester)
 	if err == nil {
 		if state == "pending" && requester != me.ID {
-			_, _ = s.db.Exec(`UPDATE friendships SET state='friends' WHERE requester_id=? AND recipient_id=?`, requester, me.ID)
+			if _, updateErr := s.db.Exec(`UPDATE friendships SET state='friends' WHERE requester_id=? AND recipient_id=?`, requester, me.ID); updateErr == nil {
+				s.addNotification(requester, me.ID, "friend_accepted", "")
+				_, _ = s.db.Exec(`UPDATE notifications SET read_at=CURRENT_TIMESTAMP(6) WHERE user_id=? AND actor_id=? AND kind='friend_request' AND read_at IS NULL`, me.ID, requester)
+			}
 			writeJSON(w, 200, map[string]string{"status": "friends"})
 			return
 		}
 		fail(w, 409, "Permintaan pertemanan sudah ada.")
 		return
 	}
-	if _, err = s.db.Exec(`INSERT INTO friendships(id,requester_id,recipient_id,state) VALUES(?,?,?,'pending')`, randomID(), me.ID, in.UserID); err != nil {
+	requestID := randomID()
+	if _, err = s.db.Exec(`INSERT INTO friendships(id,requester_id,recipient_id,state) VALUES(?,?,?,'pending')`, requestID, me.ID, in.UserID); err != nil {
 		fail(w, 500, "Permintaan pertemanan gagal dikirim.")
 		return
 	}
+	s.addNotification(in.UserID, me.ID, "friend_request", requestID)
 	writeJSON(w, 201, map[string]string{"status": "sent"})
 }
 func (s *server) acceptRequest(w http.ResponseWriter, r *http.Request) {
@@ -1202,6 +1392,11 @@ func (s *server) changeRequest(w http.ResponseWriter, r *http.Request, state str
 			return
 		}
 	} else {
+		var requesterID string
+		if err := s.db.QueryRow(`SELECT requester_id FROM friendships WHERE id=? AND recipient_id=? AND state='pending'`, r.PathValue("id"), me.ID).Scan(&requesterID); err != nil {
+			fail(w, 404, "Permintaan tidak ditemukan.")
+			return
+		}
 		res, err := s.db.Exec(`UPDATE friendships SET state='friends' WHERE id=? AND recipient_id=? AND state='pending'`, r.PathValue("id"), me.ID)
 		if err != nil {
 			fail(w, 500, "Permintaan belum dapat diterima.")
@@ -1212,7 +1407,9 @@ func (s *server) changeRequest(w http.ResponseWriter, r *http.Request, state str
 			fail(w, 404, "Permintaan tidak ditemukan.")
 			return
 		}
+		s.addNotification(requesterID, me.ID, "friend_accepted", "")
 	}
+	_, _ = s.db.Exec(`UPDATE notifications SET read_at=COALESCE(read_at,CURRENT_TIMESTAMP(6)) WHERE user_id=? AND kind='friend_request' AND entity_id=? AND read_at IS NULL`, me.ID, r.PathValue("id"))
 	writeJSON(w, 200, map[string]string{"status": state})
 }
 func (s *server) isFriend(a, b string) bool {
@@ -1230,13 +1427,15 @@ func (s *server) isBlocked(a, b string) bool {
 	return err == nil && blocked
 }
 
+const postSelect = `SELECT p.id,p.caption,p.image,p.created_at,u.id,u.name,u.username,u.bio,u.avatar,(SELECT COUNT(*) FROM post_likes pl WHERE pl.post_id=p.id),EXISTS(SELECT 1 FROM post_likes mine WHERE mine.post_id=p.id AND mine.user_id=?),(SELECT COUNT(*) FROM post_replies pr WHERE pr.post_id=p.id),EXISTS(SELECT 1 FROM saved_posts sp WHERE sp.post_id=p.id AND sp.user_id=?),COALESCE((SELECT reaction FROM post_reactions mr WHERE mr.post_id=p.id AND mr.user_id=?),''),(SELECT COUNT(*) FROM post_reactions r WHERE r.post_id=p.id AND r.reaction='heart'),(SELECT COUNT(*) FROM post_reactions r WHERE r.post_id=p.id AND r.reaction='laugh'),(SELECT COUNT(*) FROM post_reactions r WHERE r.post_id=p.id AND r.reaction='care'),(SELECT COUNT(*) FROM post_reactions r WHERE r.post_id=p.id AND r.reaction='wow'),(SELECT COUNT(*) FROM post_reactions r WHERE r.post_id=p.id AND r.reaction='sad') FROM posts p JOIN users u ON u.id=p.user_id`
+
 func (s *server) posts(w http.ResponseWriter, r *http.Request) {
 	me, ok := s.current(r)
 	if !ok {
 		fail(w, 401, "Silakan masuk terlebih dahulu.")
 		return
 	}
-	rows, err := s.db.Query(`SELECT p.id,p.caption,p.image,p.created_at,u.id,u.name,u.username,u.bio,u.avatar,(SELECT COUNT(*) FROM post_likes pl WHERE pl.post_id=p.id),EXISTS(SELECT 1 FROM post_likes mine WHERE mine.post_id=p.id AND mine.user_id=?),(SELECT COUNT(*) FROM post_replies pr WHERE pr.post_id=p.id) FROM posts p JOIN users u ON u.id=p.user_id WHERE p.user_id=? OR EXISTS(SELECT 1 FROM friendships f WHERE f.state='friends' AND ((f.requester_id=? AND f.recipient_id=p.user_id) OR (f.recipient_id=? AND f.requester_id=p.user_id))) ORDER BY p.created_at DESC LIMIT 100`, me.ID, me.ID, me.ID, me.ID)
+	rows, err := s.db.Query(postSelect+` WHERE (p.user_id=? OR EXISTS(SELECT 1 FROM friendships f WHERE f.state='friends' AND ((f.requester_id=? AND f.recipient_id=p.user_id) OR (f.recipient_id=? AND f.requester_id=p.user_id)))) AND NOT EXISTS(SELECT 1 FROM blocked_users b WHERE (b.blocker_id=? AND b.blocked_id=p.user_id) OR (b.blocker_id=p.user_id AND b.blocked_id=?)) ORDER BY p.created_at DESC LIMIT 100`, me.ID, me.ID, me.ID, me.ID, me.ID, me.ID, me.ID, me.ID)
 	if err != nil {
 		fail(w, 500, "Feed gagal dimuat.")
 		return
@@ -1247,10 +1446,12 @@ func (s *server) posts(w http.ResponseWriter, r *http.Request) {
 		var p postView
 		var image, avatar sql.NullString
 		var u publicUser
-		if rows.Scan(&p.ID, &p.Caption, &image, &p.CreatedAt, &u.ID, &u.Name, &u.Username, &u.Bio, &avatar, &p.LikeCount, &p.LikedByMe, &p.ReplyCount) == nil {
+		var heart, laugh, care, wow, sad int
+		if rows.Scan(&p.ID, &p.Caption, &image, &p.CreatedAt, &u.ID, &u.Name, &u.Username, &u.Bio, &avatar, &p.LikeCount, &p.LikedByMe, &p.ReplyCount, &p.SavedByMe, &p.MyReaction, &heart, &laugh, &care, &wow, &sad) == nil {
 			p.Image = image.String
 			u.Avatar = avatar.String
 			p.Author = u
+			p.Reactions = map[string]int{"heart": heart, "laugh": laugh, "care": care, "wow": wow, "sad": sad}
 			out = append(out, p)
 		}
 	}
@@ -1286,8 +1487,8 @@ func (s *server) createPost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		raw, err := base64.StdEncoding.DecodeString(parts[1])
-		if err != nil || len(raw) > 5<<20 {
-			fail(w, 400, "Ukuran foto maksimal 5 MB.")
+		if err != nil || len(raw) > 3<<20 {
+			fail(w, 400, "Ukuran foto maksimal 3 MB.")
 			return
 		}
 	}
@@ -1296,6 +1497,7 @@ func (s *server) createPost(w http.ResponseWriter, r *http.Request) {
 		fail(w, 500, "Postingan belum bisa disimpan.")
 		return
 	}
+	s.notifyPostFriends(me.ID, id)
 	writeJSON(w, 201, postView{ID: id, Caption: in.Caption, Image: in.Image, CreatedAt: time.Now(), Author: safe(me)})
 }
 
@@ -1305,7 +1507,228 @@ func (s *server) canViewPost(userID, postID string) bool {
 	if err != nil {
 		return false
 	}
-	return authorID == userID || s.isFriend(userID, authorID)
+	return authorID == userID || (s.isFriend(userID, authorID) && !s.isBlocked(userID, authorID))
+}
+
+func (s *server) savedPosts(w http.ResponseWriter, r *http.Request) {
+	me, ok := s.current(r)
+	if !ok {
+		fail(w, 401, "Silakan masuk terlebih dahulu.")
+		return
+	}
+	rows, err := s.db.Query(postSelect+` JOIN saved_posts mine ON mine.post_id=p.id AND mine.user_id=? WHERE (p.user_id=? OR EXISTS(SELECT 1 FROM friendships f WHERE f.state='friends' AND ((f.requester_id=? AND f.recipient_id=p.user_id) OR (f.recipient_id=? AND f.requester_id=p.user_id)))) AND NOT EXISTS(SELECT 1 FROM blocked_users b WHERE (b.blocker_id=? AND b.blocked_id=p.user_id) OR (b.blocker_id=p.user_id AND b.blocked_id=?)) ORDER BY mine.created_at DESC LIMIT 100`, me.ID, me.ID, me.ID, me.ID, me.ID, me.ID, me.ID, me.ID, me.ID)
+	if err != nil {
+		fail(w, 500, "Postingan tersimpan belum dapat dimuat.")
+		return
+	}
+	defer rows.Close()
+	out := []postView{}
+	for rows.Next() {
+		var p postView
+		var image, avatar sql.NullString
+		var u publicUser
+		var heart, laugh, care, wow, sad int
+		if err := rows.Scan(&p.ID, &p.Caption, &image, &p.CreatedAt, &u.ID, &u.Name, &u.Username, &u.Bio, &avatar, &p.LikeCount, &p.LikedByMe, &p.ReplyCount, &p.SavedByMe, &p.MyReaction, &heart, &laugh, &care, &wow, &sad); err != nil {
+			fail(w, 500, "Postingan tersimpan belum dapat dimuat.")
+			return
+		}
+		p.Image = image.String
+		u.Avatar = avatar.String
+		p.Author = u
+		p.Reactions = map[string]int{"heart": heart, "laugh": laugh, "care": care, "wow": wow, "sad": sad}
+		out = append(out, p)
+	}
+	writeJSON(w, 200, out)
+}
+
+func (s *server) savePost(w http.ResponseWriter, r *http.Request) {
+	me, ok := s.current(r)
+	if !ok {
+		fail(w, 401, "Silakan masuk terlebih dahulu.")
+		return
+	}
+	id := r.PathValue("id")
+	if !s.canViewPost(me.ID, id) {
+		fail(w, 404, "Postingan tidak ditemukan.")
+		return
+	}
+	var err error
+	if r.Method == http.MethodPut {
+		_, err = s.db.Exec(`INSERT IGNORE INTO saved_posts(post_id,user_id) VALUES(?,?)`, id, me.ID)
+	} else {
+		_, err = s.db.Exec(`DELETE FROM saved_posts WHERE post_id=? AND user_id=?`, id, me.ID)
+	}
+	if err != nil {
+		fail(w, 500, "Status simpan belum dapat diperbarui.")
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"saved": r.Method == http.MethodPut})
+}
+
+func (s *server) reactPost(w http.ResponseWriter, r *http.Request) {
+	me, ok := s.current(r)
+	if !ok {
+		fail(w, 401, "Silakan masuk terlebih dahulu.")
+		return
+	}
+	id := r.PathValue("id")
+	if !s.canViewPost(me.ID, id) {
+		fail(w, 404, "Postingan tidak ditemukan.")
+		return
+	}
+	var err error
+	if r.Method == http.MethodPut {
+		var in struct {
+			Reaction string `json:"reaction"`
+		}
+		if decode(r, &in) != nil {
+			fail(w, 400, "Reaksi tidak valid.")
+			return
+		}
+		allowed := map[string]bool{"heart": true, "laugh": true, "care": true, "wow": true, "sad": true}
+		if !allowed[in.Reaction] {
+			fail(w, 400, "Pilih reaksi yang tersedia.")
+			return
+		}
+		_, err = s.db.Exec(`INSERT INTO post_reactions(post_id,user_id,reaction) VALUES(?,?,?) ON DUPLICATE KEY UPDATE reaction=VALUES(reaction)`, id, me.ID, in.Reaction)
+	} else {
+		_, err = s.db.Exec(`DELETE FROM post_reactions WHERE post_id=? AND user_id=?`, id, me.ID)
+	}
+	if err != nil {
+		fail(w, 500, "Reaksi belum dapat disimpan.")
+		return
+	}
+	var mine string
+	_ = s.db.QueryRow(`SELECT reaction FROM post_reactions WHERE post_id=? AND user_id=?`, id, me.ID).Scan(&mine)
+	counts := map[string]int{"heart": 0, "laugh": 0, "care": 0, "wow": 0, "sad": 0}
+	rows, e := s.db.Query(`SELECT reaction,COUNT(*) FROM post_reactions WHERE post_id=? GROUP BY reaction`, id)
+	if e == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var key string
+			var n int
+			if rows.Scan(&key, &n) == nil {
+				counts[key] = n
+			}
+		}
+	}
+	writeJSON(w, 200, map[string]any{"myReaction": mine, "reactions": counts})
+}
+
+func (s *server) stories(w http.ResponseWriter, r *http.Request) {
+	me, ok := s.current(r)
+	if !ok {
+		fail(w, 401, "Silakan masuk terlebih dahulu.")
+		return
+	}
+	_, _ = s.db.Exec(`DELETE FROM stories WHERE expires_at<=CURRENT_TIMESTAMP(6) LIMIT 100`)
+	rows, err := s.db.Query(`SELECT s.id,s.caption,s.image,s.created_at,s.expires_at,(s.user_id=? OR EXISTS(SELECT 1 FROM story_views sv WHERE sv.story_id=s.id AND sv.user_id=?)),u.id,u.name,u.username,u.bio,u.avatar FROM stories s JOIN users u ON u.id=s.user_id WHERE s.expires_at>CURRENT_TIMESTAMP(6) AND (s.user_id=? OR EXISTS(SELECT 1 FROM friendships f WHERE f.state='friends' AND ((f.requester_id=? AND f.recipient_id=s.user_id) OR (f.recipient_id=? AND f.requester_id=s.user_id)))) AND NOT EXISTS(SELECT 1 FROM blocked_users b WHERE (b.blocker_id=? AND b.blocked_id=s.user_id) OR (b.blocker_id=s.user_id AND b.blocked_id=?)) ORDER BY s.created_at`, me.ID, me.ID, me.ID, me.ID, me.ID, me.ID, me.ID)
+	if err != nil {
+		fail(w, 500, "Cerita belum dapat dimuat.")
+		return
+	}
+	defer rows.Close()
+	out := []storyView{}
+	for rows.Next() {
+		var st storyView
+		var image, avatar sql.NullString
+		if rows.Scan(&st.ID, &st.Caption, &image, &st.CreatedAt, &st.ExpiresAt, &st.Viewed, &st.Author.ID, &st.Author.Name, &st.Author.Username, &st.Author.Bio, &avatar) != nil {
+			continue
+		}
+		st.Image = image.String
+		st.Author.Avatar = avatar.String
+		out = append(out, st)
+	}
+	writeJSON(w, 200, out)
+}
+
+func (s *server) canViewStory(userID, storyID string) bool {
+	var owner string
+	if s.db.QueryRow(`SELECT user_id FROM stories WHERE id=? AND expires_at>CURRENT_TIMESTAMP(6)`, storyID).Scan(&owner) != nil {
+		return false
+	}
+	return owner == userID || (s.isFriend(userID, owner) && !s.isBlocked(userID, owner))
+}
+
+func (s *server) createStory(w http.ResponseWriter, r *http.Request) {
+	me, ok := s.current(r)
+	if !ok {
+		fail(w, 401, "Silakan masuk terlebih dahulu.")
+		return
+	}
+	if !me.Onboarding {
+		fail(w, 403, "Lengkapi profil terlebih dahulu.")
+		return
+	}
+	var in struct {
+		Caption string `json:"caption"`
+		Image   string `json:"image"`
+	}
+	if decode(r, &in) != nil {
+		fail(w, 400, "Cerita tidak valid.")
+		return
+	}
+	in.Caption = strings.TrimSpace(in.Caption)
+	if len([]rune(in.Caption)) > 280 || (in.Caption == "" && in.Image == "") {
+		fail(w, 400, "Tambahkan teks atau foto. Teks maksimal 280 karakter.")
+		return
+	}
+	if in.Image != "" {
+		parts := strings.SplitN(in.Image, ",", 2)
+		if len(parts) != 2 || !(strings.HasPrefix(parts[0], "data:image/jpeg;base64") || strings.HasPrefix(parts[0], "data:image/png;base64") || strings.HasPrefix(parts[0], "data:image/webp;base64")) {
+			fail(w, 400, "Gunakan foto JPEG, PNG, atau WebP.")
+			return
+		}
+		raw, e := base64.StdEncoding.DecodeString(parts[1])
+		if e != nil || len(raw) > 3<<20 {
+			fail(w, 400, "Ukuran foto maksimal 3 MB.")
+			return
+		}
+	}
+	id := randomID()
+	_, err := s.db.Exec(`INSERT INTO stories(id,user_id,caption,image,expires_at) VALUES(?,?,?,?,DATE_ADD(CURRENT_TIMESTAMP(6),INTERVAL 24 HOUR))`, id, me.ID, in.Caption, nullString(in.Image))
+	if err != nil {
+		fail(w, 500, "Cerita belum dapat disimpan.")
+		return
+	}
+	writeJSON(w, 201, map[string]string{"id": id})
+}
+
+func (s *server) viewStory(w http.ResponseWriter, r *http.Request) {
+	me, ok := s.current(r)
+	if !ok {
+		fail(w, 401, "Silakan masuk terlebih dahulu.")
+		return
+	}
+	id := r.PathValue("id")
+	if !s.canViewStory(me.ID, id) {
+		fail(w, 404, "Cerita tidak ditemukan.")
+		return
+	}
+	if _, err := s.db.Exec(`INSERT IGNORE INTO story_views(story_id,user_id) VALUES(?,?)`, id, me.ID); err != nil {
+		fail(w, 500, "Tampilan cerita belum dapat disimpan.")
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+func (s *server) deleteStory(w http.ResponseWriter, r *http.Request) {
+	me, ok := s.current(r)
+	if !ok {
+		fail(w, 401, "Silakan masuk terlebih dahulu.")
+		return
+	}
+	res, err := s.db.Exec(`DELETE FROM stories WHERE id=? AND user_id=?`, r.PathValue("id"), me.ID)
+	if err != nil {
+		fail(w, 500, "Cerita belum dapat dihapus.")
+		return
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		fail(w, 404, "Cerita tidak ditemukan.")
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
 func (s *server) likePost(w http.ResponseWriter, r *http.Request) {
@@ -1321,7 +1744,16 @@ func (s *server) likePost(w http.ResponseWriter, r *http.Request) {
 	}
 	var err error
 	if r.Method == http.MethodPut {
-		_, err = s.db.Exec(`INSERT IGNORE INTO post_likes(post_id,user_id) VALUES(?,?)`, postID, me.ID)
+		var result sql.Result
+		result, err = s.db.Exec(`INSERT IGNORE INTO post_likes(post_id,user_id) VALUES(?,?)`, postID, me.ID)
+		if err == nil {
+			if inserted, _ := result.RowsAffected(); inserted > 0 {
+				var ownerID string
+				if s.db.QueryRow(`SELECT user_id FROM posts WHERE id=?`, postID).Scan(&ownerID) == nil {
+					s.addNotification(ownerID, me.ID, "like", postID)
+				}
+			}
+		}
 	} else {
 		_, err = s.db.Exec(`DELETE FROM post_likes WHERE post_id=? AND user_id=?`, postID, me.ID)
 	}
@@ -1400,6 +1832,10 @@ func (s *server) createPostReply(w http.ResponseWriter, r *http.Request) {
 		fail(w, 500, "Balasan belum dapat disimpan.")
 		return
 	}
+	var ownerID string
+	if s.db.QueryRow(`SELECT user_id FROM posts WHERE id=?`, postID).Scan(&ownerID) == nil {
+		s.addNotification(ownerID, me.ID, "reply", postID)
+	}
 	writeJSON(w, 201, postReplyView{ID: id, Body: in.Body, CreatedAt: time.Now(), Author: safe(me)})
 }
 
@@ -1457,8 +1893,8 @@ func (s *server) updatePost(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			raw, err := base64.StdEncoding.DecodeString(parts[1])
-			if err != nil || len(raw) > 5<<20 {
-				fail(w, 400, "Ukuran foto maksimal 5 MB.")
+			if err != nil || len(raw) > 3<<20 {
+				fail(w, 400, "Ukuran foto maksimal 3 MB.")
 				return
 			}
 		}
@@ -1543,6 +1979,7 @@ func (s *server) messages(w http.ResponseWriter, r *http.Request) {
 		fail(w, 500, "Status pesan gagal diperbarui.")
 		return
 	}
+	_, _ = s.db.Exec(`UPDATE notifications SET read_at=COALESCE(read_at,CURRENT_TIMESTAMP(6)) WHERE user_id=? AND actor_id=? AND kind='message' AND read_at IS NULL`, me.ID, other)
 	rows, err := s.db.Query(`SELECT m.id,m.sender_id,m.recipient_id,m.body,m.created_at,COALESCE(a.image,''),CASE WHEN m.sender_id=? THEN IF(cr.last_read_at>=m.created_at,1,0) ELSE 0 END FROM messages m LEFT JOIN message_attachments a ON a.message_id=m.id LEFT JOIN conversation_reads cr ON cr.user_id=m.recipient_id AND cr.peer_id=m.sender_id WHERE (m.sender_id=? AND m.recipient_id=?) OR (m.sender_id=? AND m.recipient_id=?) ORDER BY m.created_at DESC LIMIT 100`, other, me.ID, other, other, me.ID)
 	if err != nil {
 		fail(w, 500, "Pesan gagal dimuat.")
@@ -1595,8 +2032,8 @@ func (s *server) sendMessage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		raw, err := base64.StdEncoding.DecodeString(parts[1])
-		if err != nil || len(raw) > 5<<20 {
-			fail(w, 400, "Ukuran foto chat maksimal 5 MB.")
+		if err != nil || len(raw) > 3<<20 {
+			fail(w, 400, "Ukuran foto chat maksimal 3 MB.")
 			return
 		}
 	}
@@ -1622,5 +2059,6 @@ func (s *server) sendMessage(w http.ResponseWriter, r *http.Request) {
 		fail(w, 500, "Pesan belum terkirim.")
 		return
 	}
+	s.addNotification(in.UserID, me.ID, "message", id)
 	writeJSON(w, 201, map[string]any{"id": id, "senderId": me.ID, "recipientId": in.UserID, "body": in.Body, "image": in.Image, "createdAt": time.Now(), "read": false})
 }
