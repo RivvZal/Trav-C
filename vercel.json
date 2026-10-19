@@ -1,4 +1,9 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "framework": "go"
+  "framework": "go",
+  "build": {
+    "env": {
+      "GO_BUILD_FLAGS": "-buildvcs=false -ldflags '-s -w'"
+    }
+  }
 }
